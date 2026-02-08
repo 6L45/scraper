@@ -8,8 +8,8 @@ from urllib.parse import urljoin
 import pandas as pd
 
 SLEEP=9
-PARQUET="/home/r33f/work/script/scraper/parquets/processed-papers-metadata.parquet"
-PDF_DIR="/home/r33f/work/script/scraper/global/output-pdfs"
+PARQUET=""
+PDF_DIR="."
 
 def download_scihub_article(doi, output_dir=PDF_DIR):
     """Télécharge un article depuis Sci-Hub avec le vrai lien PDF"""
