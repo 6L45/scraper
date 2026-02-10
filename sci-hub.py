@@ -6,10 +6,50 @@ import sys
 import time
 from urllib.parse import urljoin
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from pathlib import Path
 
-SLEEP=9
-PARQUET=""
-PDF_DIR="."
+SLEEP=4
+PARQUET=
+PDF_DIR=
+
+def sanitize_doi_for_filename(doi):
+    """Nettoie le DOI pour l'utiliser comme nom de fichier"""
+    # Remplacer / et : par _
+    sanitized = doi.replace('/', '_').replace(':', '_')
+    # S'assurer qu'on a l'extension .pdf
+    if not sanitized.endswith('.pdf'):
+        sanitized += '.pdf'
+    return sanitized
+
+def update_parquet_status(doi, parquet_path=PARQUET):
+    """Met à jour le statut PDF_on_S3 à True pour un DOI donné"""
+    try:
+        # Lire le fichier Parquet
+        df = pd.read_parquet(parquet_path)
+
+        # Trouver l'index du DOI
+        mask = df['DOI'] == doi
+
+        if mask.any():
+            # Mettre à jour le statut
+            df.loc[mask, 'PDF_on_S3'] = True
+
+            # Sauvegarder le fichier Parquet
+            df.to_parquet(parquet_path, index=False)
+
+            # Compter combien de lignes ont été mises à jour
+            updated_count = mask.sum()
+            print(f"  ✅ Mis à jour {updated_count} ligne(s) dans le Parquet pour DOI: {doi}")
+            return True
+        else:
+            print(f"  ⚠️  DOI non trouvé dans le Parquet: {doi}")
+            return False
+
+    except Exception as e:
+        print(f"  ❌ Erreur lors de la mise à jour du Parquet: {e}")
+        return False
 
 def download_scihub_article(doi, output_dir=PDF_DIR):
     """Télécharge un article depuis Sci-Hub avec le vrai lien PDF"""
@@ -114,7 +154,7 @@ def download_scihub_article(doi, output_dir=PDF_DIR):
 
             print(f"  🔗 URL PDF complète: {pdf_url}")
 
-            # Extraire le titre pour le nom de fichier
+            # Extraire le titre pour l'affichage seulement (pas pour le nom de fichier)
             title = None
 
             # Chercher dans les meta tags
@@ -132,22 +172,17 @@ def download_scihub_article(doi, output_dir=PDF_DIR):
                     title = re.sub(r'\s*-\s*DOI:\s*[^\s]+$', '', title)
                     print(f"  📝 Titre extrait: {title[:80]}...")
 
-            # Générer le nom de fichier
-            if title:
-                # Nettoyer le titre
-                title = re.sub(r'<[^>]+>', '', title)  # Enlever les tags HTML
-                title = re.sub(r'[<>:"/\\|?*]', '_', title)  # Remplacer caractères invalides
-                title = re.sub(r'\s+', ' ', title).strip()  # Normaliser espaces
-
-                if len(title) > 120:
-                    title = title[:120] + "..."
-
-                filename = f"{title}.pdf"
-
-            else:
-                filename = f"{doi.replace('/', '_')}.pdf"
-
+            # Utiliser uniquement le DOI sanitizé pour le nom de fichier
+            filename = sanitize_doi_for_filename(doi)
             filepath = os.path.join(output_dir, filename)
+
+            # Vérifier si le fichier existe déjà
+            if os.path.exists(filepath):
+                file_size = os.path.getsize(filepath) / 1024 / 1024
+                print(f"  ⏭️  Fichier existe déjà: {filename} ({file_size:.1f} MB)")
+                # Mettre quand même à jour le Parquet si le fichier existe déjà
+                update_parquet_status(doi)
+                return filepath
 
             # Créer le répertoire si nécessaire
             os.makedirs(output_dir, exist_ok=True)
@@ -201,6 +236,9 @@ def download_scihub_article(doi, output_dir=PDF_DIR):
             file_size = os.path.getsize(filepath) / 1024 / 1024
             print(f"  ✅ Téléchargement réussi! ({file_size:.1f} MB)")
 
+            # Mettre à jour le Parquet après un téléchargement réussi
+            update_parquet_status(doi)
+
             return filepath
 
         except requests.exceptions.Timeout:
@@ -215,36 +253,83 @@ def download_scihub_article(doi, output_dir=PDF_DIR):
 
 def main():
     df = pd.read_parquet(PARQUET)
+    # Convertir Publication_Year en numérique, les erreurs deviennent NaN
+    df['Publication_Year'] = pd.to_numeric(df['Publication_Year'], errors='coerce')
+
     filtered_df = df[
-                (df['Publication_Year'] < 2020) &
-                (df['Is_Open_Access'] == True) &
-                (df['PDF_on_S3'] == False)
+            (df['Publication_Year'] < 2020) &
+            (df['Is_Open_Access'] == True) &
+            (df['PDF_on_S3'] == False)
             ]
+
+    print("📊 Statistiques initiales:")
+    filtered_df.info()
+
+    # Compter combien d'articles seront téléchargés
+    initial_count = len(filtered_df)
+    print(f"\n📊 Nombre d'articles à télécharger: {initial_count}")
 
     # Extraire tous les DOIs
     dois = filtered_df['DOI'].dropna()  # Supprime les NaN
     dois = dois[dois != '']             # Supprime les chaînes vides
     dois = dois.tolist()                # Convertit en liste
 
-    for doi in dois:
+    if not dois:
+        print("❌ Aucun DOI valide à traiter.")
+        return
+
+    successful_downloads = 0
+    failed_downloads = 0
+
+    for i, doi in enumerate(dois, 1):
         print("=" * 60)
+        print(f"📚 Article {i}/{len(dois)}")
         print(f"🔍 Recherche de l'article: {doi}")
         print("=" * 60)
 
         filepath = download_scihub_article(doi)
 
-
         if filepath:
+            # Afficher le nom de fichier selon la convention
+            filename = sanitize_doi_for_filename(doi)
             print(f"✅ Article téléchargé avec succès!")
-            print(f"📁 Fichier: {filepath}")
+            print(f"📁 Nom du fichier (convention DOI): {filename}")
             print(f"📂 Chemin complet: {os.path.abspath(filepath)}")
+            successful_downloads += 1
         else:
             print(f"\n❌ Échec du téléchargement {doi}")
+            failed_downloads += 1
+
         print("_" * 60)
 
+        # Afficher les statistiques actuelles
+        print(f"\n📈 Progression: {successful_downloads} réussis, {failed_downloads} échecs, {len(dois) - i} restants")
 
         # Petite pause entre les essais
-        time.sleep(SLEEP)
+        if i < len(dois):  # Pas de pause après le dernier
+            print(f"⏳ Pause de {SLEEP} secondes...")
+            time.sleep(SLEEP)
+
+    # Résumé final
+    print("\n" + "="*60)
+    print("📊 RÉSUMÉ FINAL")
+    print("="*60)
+    print(f"✅ Téléchargements réussis: {successful_downloads}")
+    print(f"❌ Téléchargements échoués: {failed_downloads}")
+    print(f"📂 Total d'articles traités: {len(dois)}")
+
+    # Vérifier combien d'articles restent à télécharger
+    df_updated = pd.read_parquet(PARQUET)
+    df_updated['Publication_Year'] = pd.to_numeric(df_updated['Publication_Year'], errors='coerce')
+
+    remaining_df = df_updated[
+            (df_updated['Publication_Year'] < 2020) &
+            (df_updated['Is_Open_Access'] == True) &
+            (df_updated['PDF_on_S3'] == False)
+            ]
+
+    print(f"📋 Articles restant à télécharger: {len(remaining_df)}")
+    print("="*60)
 
 if __name__ == "__main__":
     main()
